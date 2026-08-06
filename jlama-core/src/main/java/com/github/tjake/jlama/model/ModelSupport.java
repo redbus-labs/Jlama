@@ -18,6 +18,7 @@ package com.github.tjake.jlama.model;
 import com.github.tjake.jlama.model.bert.BertModelType;
 import com.github.tjake.jlama.model.gemma.GemmaModelType;
 import com.github.tjake.jlama.model.gemma2.Gemma2ModelType;
+import com.github.tjake.jlama.model.gemma3.Gemma3ModelType;
 import com.github.tjake.jlama.model.gemma4.Gemma4ModelType;
 import com.github.tjake.jlama.model.gpt2.GPT2ModelType;
 import com.github.tjake.jlama.model.granite.GraniteModelType;
@@ -55,6 +56,7 @@ public class ModelSupport {
         register("BERT", new BertModelType());
         register("GEMMA", new GemmaModelType());
         register("GEMMA2", new Gemma2ModelType());
+        register("GEMMA3", new Gemma3ModelType());
         register("GEMMA4", new Gemma4ModelType());
         register("GEMMA4_UNIFIED", new Gemma4ModelType());
         register("GPT2", new GPT2ModelType());
