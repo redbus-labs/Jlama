@@ -38,9 +38,11 @@ public class JOCLTensorOperations implements TensorOperations {
     private cl_context context;
     private cl_command_queue commandQueue;
     private cl_program gemmProgram;
+    private cl_program q4Program;
     private cl_device_id device;
     private cl_kernel matvecKernel;
     private cl_kernel gemmTiledKernel;
+    private cl_kernel matvecQ4Kernel;
 
     private long maxWorkGroupSize;
     private long globalMemSize;
@@ -82,11 +84,12 @@ public class JOCLTensorOperations implements TensorOperations {
         int rRowOffset, int bRowOffset, int rowChunkSize
     ) {
         // If weight tensor B is on GPU, use GPU matmul
-        // Use GPU when weights are pre-loaded. The rowOffset fix ensures correct results.
-        // Transfer overhead exists but correctness > speed for now.
-        // TODO: Optimize by pre-allocating input/output buffers to reduce malloc overhead.
+        // Use GPU when weights are pre-loaded AND are F32/F16/BF16.
+        // Quantized tensors (Q4, Q5, I8) use packed formats that our GPU kernels can't read.
+        // For quantized models, fall through to CPU Panama for quantized tensors, which handles them natively.
         cl_mem gpuB = gpuBuffers.get(b);
-        if (gpuB != null && initialized) {
+        boolean isQuantized = (b.dType() == DType.Q4 || b.dType() == DType.Q5 || b.dType() == DType.I8);
+        if (gpuB != null && initialized && !isQuantized) {
             try {
                 int K = columnLimit;  // number of input features
                 int M = rowChunkSize; // number of output rows to compute
@@ -156,6 +159,60 @@ public class JOCLTensorOperations implements TensorOperations {
             }
         }
 
+        // Q4 GPU path: EXPERIMENTAL - disabled pending scale layout fix
+        // The Q4 kernel produces incorrect output due to scale tensor layout mismatch.
+        // CPU Panama handles Q4 correctly at 12+ tok/s which is good enough for now.
+        // TODO: Fix scale indexing to match Jlama's 2D blockF tensor layout
+        /*
+        cl_mem gpuQ4Data = gpuBuffers.get(b);
+        cl_mem gpuQ4Scale = gpuQ4Scales.get(b);
+        if (gpuQ4Data != null && gpuQ4Scale != null && initialized && b.dType() == DType.Q4 && a.shape().first() == 1) {
+            try {
+                int K = columnLimit;
+                int M = rowChunkSize;
+
+                // Extract F32 input vector
+                float[] inputVec = new float[K];
+                for (int k = 0; k < K; k++) {
+                    inputVec[k] = a.get(0, aColumnOffset + k);
+                }
+
+                float[] outputVec = new float[M];
+
+                cl_mem bufInput = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                    (long) Sizeof.cl_float * K, Pointer.to(inputVec), null);
+                cl_mem bufOutput = clCreateBuffer(context, CL_MEM_WRITE_ONLY,
+                    (long) Sizeof.cl_float * M, null, null);
+
+                // matvec_q4(A_q4, A_scales, x, y, M, K, rowOffset)
+                clSetKernelArg(matvecQ4Kernel, 0, Sizeof.cl_mem, Pointer.to(gpuQ4Data));
+                clSetKernelArg(matvecQ4Kernel, 1, Sizeof.cl_mem, Pointer.to(gpuQ4Scale));
+                clSetKernelArg(matvecQ4Kernel, 2, Sizeof.cl_mem, Pointer.to(bufInput));
+                clSetKernelArg(matvecQ4Kernel, 3, Sizeof.cl_mem, Pointer.to(bufOutput));
+                clSetKernelArg(matvecQ4Kernel, 4, Sizeof.cl_int, Pointer.to(new int[]{M}));
+                clSetKernelArg(matvecQ4Kernel, 5, Sizeof.cl_int, Pointer.to(new int[]{K}));
+                clSetKernelArg(matvecQ4Kernel, 6, Sizeof.cl_int, Pointer.to(new int[]{bRowOffset}));
+
+                long[] globalWorkSize = new long[]{roundUp(M, 64)};
+                long[] localWorkSize = new long[]{Math.min(64, maxWorkGroupSize)};
+                clEnqueueNDRangeKernel(commandQueue, matvecQ4Kernel, 1, null, globalWorkSize, localWorkSize, 0, null, null);
+
+                clEnqueueReadBuffer(commandQueue, bufOutput, CL_TRUE, 0,
+                    (long) Sizeof.cl_float * M, Pointer.to(outputVec), 0, null, null);
+
+                for (int m = 0; m < M; m++) {
+                    result.set(result.get(0, rRowOffset + m) + outputVec[m], 0, rRowOffset + m);
+                }
+
+                clReleaseMemObject(bufInput);
+                clReleaseMemObject(bufOutput);
+                return;
+            } catch (Exception e) {
+                logger.debug("GPU Q4 matmul failed, falling back to CPU: {}", e.getMessage());
+            }
+        }
+        */
+
         // Fallback to CPU
         cpuOps.batchDotProduct(result, a, b, aColumnOffset, bColumnOffset, columnLimit, rRowOffset, bRowOffset, rowChunkSize);
     }
@@ -200,47 +257,83 @@ public class JOCLTensorOperations implements TensorOperations {
 
     // Persistent GPU buffers for model weights (uploaded once, reused every forward pass)
     private final java.util.Map<AbstractTensor, cl_mem> gpuBuffers = new java.util.concurrent.ConcurrentHashMap<>();
+    // Q4 tensors need TWO buffers: packed data + scales
+    private final java.util.Map<AbstractTensor, cl_mem> gpuQ4Scales = new java.util.concurrent.ConcurrentHashMap<>();
     private long gpuMemoryUsed = 0;
 
     @Override
     public void registerModelTensor(AbstractTensor t) {
-        // Upload weight tensor to GPU memory — stays there permanently
         if (!initialized) {
             cpuOps.registerModelTensor(t);
             return;
         }
 
         try {
-            int numElements = (int) t.size();
-            long byteSize = (long) numElements * Sizeof.cl_float;
+            if (t.dType() == DType.Q4) {
+                // Upload Q4 tensor: packed bytes + scale floats separately
+                com.github.tjake.jlama.tensor.Q4ByteBufferTensor q4t = (com.github.tjake.jlama.tensor.Q4ByteBufferTensor) t;
+                int numElements = (int) t.size();
+                int numBytes = numElements / 2; // 2 nibbles per byte
+                int numBlocks = numElements / 32; // 32 per block
 
-            // Check if we have enough GPU memory (leave 2GB headroom for activations)
-            if (gpuMemoryUsed + byteSize > globalMemSize - (2L * 1024 * 1024 * 1024)) {
-                logger.debug("GPU memory full, tensor stays on CPU: {} elements", numElements);
-                cpuOps.registerModelTensor(t);
-                return;
+                // Extract packed bytes from memory segment
+                byte[] packedData = new byte[numBytes];
+                java.lang.foreign.MemorySegment seg = q4t.getMemorySegment();
+                for (int i = 0; i < numBytes; i++) {
+                    packedData[i] = seg.get(java.lang.foreign.ValueLayout.JAVA_BYTE, i);
+                }
+
+                // Extract scales from blockF
+                com.github.tjake.jlama.tensor.FloatBufferTensor blockF = q4t.getBlockF();
+                float[] scales = new float[(int) blockF.size()];
+                int[] sCursor = new int[blockF.dims()];
+                int sIdx = 0;
+                while (blockF.iterate(sCursor) && sIdx < scales.length) {
+                    scales[sIdx++] = blockF.get(sCursor);
+                }
+
+                long byteSize = (long) numBytes + (long) scales.length * Sizeof.cl_float;
+                if (gpuMemoryUsed + byteSize > globalMemSize - (2L * 1024 * 1024 * 1024)) {
+                    cpuOps.registerModelTensor(t);
+                    return;
+                }
+
+                // Upload packed data
+                cl_mem gpuData = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                    numBytes, Pointer.to(packedData), null);
+                // Upload scales
+                cl_mem gpuScales = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                    (long) scales.length * Sizeof.cl_float, Pointer.to(scales), null);
+
+                gpuBuffers.put(t, gpuData);
+                gpuQ4Scales.put(t, gpuScales);
+                gpuMemoryUsed += byteSize;
+
+            } else {
+                // F32/BF16/F16: upload as float array
+                int numElements = (int) t.size();
+                long byteSize = (long) numElements * Sizeof.cl_float;
+
+                if (gpuMemoryUsed + byteSize > globalMemSize - (2L * 1024 * 1024 * 1024)) {
+                    cpuOps.registerModelTensor(t);
+                    return;
+                }
+
+                float[] data = new float[numElements];
+                int[] cursor = new int[t.dims()];
+                int idx = 0;
+                while (t.iterate(cursor) && idx < numElements) {
+                    data[idx++] = t.get(cursor);
+                }
+
+                cl_mem gpuBuf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                    byteSize, Pointer.to(data), null);
+
+                gpuBuffers.put(t, gpuBuf);
+                gpuMemoryUsed += byteSize;
             }
-
-            // Extract float data from tensor using cursor iteration
-            float[] data = new float[numElements];
-            int[] cursor = new int[t.dims()];
-            int idx = 0;
-            while (t.iterate(cursor) && idx < numElements) {
-                data[idx++] = t.get(cursor);
-            }
-
-            // Upload to GPU (READ_ONLY — weights don't change during inference)
-            cl_mem gpuBuf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                byteSize, Pointer.to(data), null);
-
-            gpuBuffers.put(t, gpuBuf);
-            gpuMemoryUsed += byteSize;
-
-            logger.debug("Uploaded tensor to GPU: {} elements ({} MB, total GPU: {} MB)",
-                numElements, byteSize / (1024 * 1024), gpuMemoryUsed / (1024 * 1024));
-
         } catch (Exception e) {
-            logger.debug("Failed to upload tensor to GPU, keeping on CPU: {}", e.getMessage());
+            logger.debug("Failed to upload tensor to GPU: {}", e.getMessage());
             cpuOps.registerModelTensor(t);
         }
     }
@@ -348,8 +441,10 @@ public class JOCLTensorOperations implements TensorOperations {
 
             // Compile kernels
             this.gemmProgram = buildProgram("opencl/gemm.cl");
+            this.q4Program = buildProgram("opencl/gemm_q4.cl");
             this.matvecKernel = clCreateKernel(gemmProgram, "matvec_f32", null);
             this.gemmTiledKernel = clCreateKernel(gemmProgram, "gemm_f32_tiled", null);
+            this.matvecQ4Kernel = clCreateKernel(q4Program, "matvec_q4", null);
 
             this.initialized = true;
             logger.info("JOCL GPU backend ready.");
@@ -404,19 +499,23 @@ public class JOCLTensorOperations implements TensorOperations {
 
     public void shutdown() {
         if (!initialized) return;
-        // Release all persistent GPU weight buffers
         for (cl_mem buf : gpuBuffers.values()) {
             clReleaseMemObject(buf);
         }
+        for (cl_mem buf : gpuQ4Scales.values()) {
+            clReleaseMemObject(buf);
+        }
         gpuBuffers.clear();
+        gpuQ4Scales.clear();
         gpuMemoryUsed = 0;
 
         clReleaseKernel(matvecKernel);
         clReleaseKernel(gemmTiledKernel);
+        clReleaseKernel(matvecQ4Kernel);
         clReleaseProgram(gemmProgram);
+        clReleaseProgram(q4Program);
         clReleaseCommandQueue(commandQueue);
         clReleaseContext(context);
         initialized = false;
-        logger.info("JOCL GPU backend shut down. Released {} MB GPU memory.", gpuMemoryUsed / (1024 * 1024));
     }
 }
