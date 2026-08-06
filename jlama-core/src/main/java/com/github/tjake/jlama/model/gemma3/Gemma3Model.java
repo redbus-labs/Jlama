@@ -13,6 +13,7 @@ import com.github.tjake.jlama.math.FloatConversions;
 import com.github.tjake.jlama.model.*;
 import com.github.tjake.jlama.model.functions.EmbedInput;
 import com.github.tjake.jlama.model.functions.SampleOutput;
+import com.github.tjake.jlama.model.gemma4.Gemma4Attention;
 import com.github.tjake.jlama.model.llama.LlamaModel;
 import com.github.tjake.jlama.safetensors.Config;
 import com.github.tjake.jlama.safetensors.DType;
@@ -85,26 +86,25 @@ public class Gemma3Model extends LlamaModel {
         TransformerBlock[] transformerBlocks = new TransformerBlock[c.dctx().numberOfLayers];
 
         IntStream.range(c.dctx().layerStart, c.dctx().layerEnd).parallel().forEach(i -> {
-            // Gemma 3 uses model.layers.X prefix (text-only) or model.language_model.layers.X (multimodal)
-            // Try language_model prefix first, fall back to model.layers
-            String base;
-            try {
-                weights.load("model.language_model.layers." + i + ".input_layernorm.weight");
-                base = "model.language_model.layers." + i + ".";
-            } catch (Exception e) {
-                base = "model.layers." + i + ".";
-            }
+            // Gemma 3 multimodal uses language_model.model.layers.X prefix
+            String base = "language_model.model.layers." + i + ".";
 
             String prefix = base + "self_attn.";
 
-            // Gemma 3 has standard Q/K/V/O projections (NOT K=V like Gemma 4)
-            CausalSelfAttention attention = new CausalSelfAttention(
+            // Gemma 3 has Q/K/V/O projections + QK normalization (q_norm, k_norm)
+            AbstractTensor qNormWeight = weights.load(prefix + "q_norm.weight").quantize(qType);
+            AbstractTensor kNormWeight = weights.load(prefix + "k_norm.weight").quantize(qType);
+
+            Gemma4Attention attention = new Gemma4Attention(
                 this,
                 i,
                 weights.load(prefix + "q_proj.weight", c.dctx(), true, false).quantize(qType),
                 weights.load(prefix + "k_proj.weight", c.dctx(), true, false).quantize(qType),
                 weights.load(prefix + "v_proj.weight", c.dctx(), true, false).quantize(qType),
-                weights.load(prefix + "o_proj.weight", c.dctx(), false, true).quantize(qType)
+                weights.load(prefix + "o_proj.weight", c.dctx(), false, true).quantize(qType),
+                qNormWeight,
+                kNormWeight,
+                c.layerNormEps
             );
 
             // MLP: gate_proj, down_proj, up_proj (SwiGLU)
@@ -142,12 +142,7 @@ public class Gemma3Model extends LlamaModel {
 
     @Override
     protected EmbedInput loadInputWeights() {
-        // Try language_model prefix first
-        try {
-            if (wte == null) wte = weights.load("model.language_model.embed_tokens.weight").quantize(workingDType);
-        } catch (Exception e) {
-            if (wte == null) wte = weights.load("model.embed_tokens.weight").quantize(workingDType);
-        }
+        if (wte == null) wte = weights.load("language_model.model.embed_tokens.weight").quantize(workingDType);
 
         return (inputToken, position) -> {
             AbstractTensor embedding = makeDenseTensor(c.embeddingLength);
@@ -169,21 +164,9 @@ public class Gemma3Model extends LlamaModel {
     protected SampleOutput loadOutputWeights() {
         DType qType = modelQType.orElse(this.modelDType);
 
-        try {
-            if (wte == null) wte = weights.load("model.language_model.embed_tokens.weight").quantize(workingDType);
-        } catch (Exception e) {
-            if (wte == null) wte = weights.load("model.embed_tokens.weight").quantize(workingDType);
-        }
+        if (wte == null) wte = weights.load("language_model.model.embed_tokens.weight").quantize(workingDType);
 
-        // Try language_model prefix for norm
-        AbstractTensor normWeight;
-        try {
-            normWeight = weights.load("model.language_model.norm.weight").quantize(qType);
-        } catch (Exception e) {
-            normWeight = weights.load("model.norm.weight").quantize(qType);
-        }
-
-        final LayerNorm layerNorm = new RMSNorm(this, normWeight, 1.0f);
+        final LayerNorm layerNorm = new RMSNorm(this, weights.load("language_model.model.norm.weight").quantize(qType), 1.0f);
 
         return new SampleOutput() {
             @Override

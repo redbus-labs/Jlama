@@ -108,15 +108,15 @@ public class Gemma3Config extends Config {
 
         @JsonCreator
         public TextConfig(
-            @JsonProperty("max_position_embeddings") int contextLength,
-            @JsonProperty("hidden_size") int embeddingLength,
-            @JsonProperty("intermediate_size") int hiddenLength,
-            @JsonProperty("num_attention_heads") int numberOfHeads,
-            @JsonProperty("num_key_value_heads") int numberOfKeyValueHeads,
-            @JsonProperty("num_hidden_layers") int numberOfLayers,
-            @JsonProperty("rms_norm_eps") float layerNormEps,
-            @JsonProperty("vocab_size") int vocabularySize,
-            @JsonProperty("bos_token_id") int bosToken,
+            @JsonProperty("max_position_embeddings") Integer contextLength,
+            @JsonProperty("hidden_size") Integer embeddingLength,
+            @JsonProperty("intermediate_size") Integer hiddenLength,
+            @JsonProperty("num_attention_heads") Integer numberOfHeads,
+            @JsonProperty("num_key_value_heads") Integer numberOfKeyValueHeads,
+            @JsonProperty("num_hidden_layers") Integer numberOfLayers,
+            @JsonProperty("rms_norm_eps") Float layerNormEps,
+            @JsonProperty("vocab_size") Integer vocabularySize,
+            @JsonProperty("bos_token_id") Integer bosToken,
             @JsonProperty("head_dim") Integer headDim,
             @JsonProperty("sliding_window") Integer slidingWindow,
             @JsonProperty("rope_theta") Double ropeTheta,
@@ -125,16 +125,17 @@ public class Gemma3Config extends Config {
             @JsonProperty("query_pre_attn_scalar") Float queryPreAttnScalar,
             @JsonProperty("layer_types") List<String> layerTypes
         ) {
-            this.contextLength = contextLength;
-            this.embeddingLength = embeddingLength;
-            this.hiddenLength = hiddenLength;
-            this.numberOfHeads = numberOfHeads;
-            this.numberOfKeyValueHeads = numberOfKeyValueHeads;
-            this.numberOfLayers = numberOfLayers;
-            this.layerNormEps = layerNormEps;
-            this.vocabularySize = vocabularySize;
-            this.bosToken = bosToken;
-            this.headDim = headDim;
+            // Gemma 3 4B defaults (sparse config only has hidden_size, intermediate_size, num_hidden_layers)
+            this.embeddingLength = embeddingLength != null ? embeddingLength : 2560;
+            this.hiddenLength = hiddenLength != null ? hiddenLength : 10240;
+            this.numberOfLayers = numberOfLayers != null ? numberOfLayers : 34;
+            this.numberOfHeads = numberOfHeads != null ? numberOfHeads : 8;
+            this.numberOfKeyValueHeads = numberOfKeyValueHeads != null ? numberOfKeyValueHeads : 4;
+            this.contextLength = contextLength != null ? contextLength : 131072;
+            this.layerNormEps = layerNormEps != null ? layerNormEps : 1e-6f;
+            this.vocabularySize = vocabularySize != null ? vocabularySize : 262208;
+            this.bosToken = bosToken != null ? bosToken : 2;
+            this.headDim = headDim != null ? headDim : 256;
             this.slidingWindow = slidingWindow;
             this.ropeTheta = ropeTheta;
             this.finalLogitSoftCapping = finalLogitSoftCapping;
