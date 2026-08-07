@@ -104,6 +104,19 @@ public class GpuInferenceEngine {
     private int qProjRows, kProjRows, vProjRows, oProjRows;
     private int gateProjRows, upProjRows, downProjRows;
 
+    // Pre-allocated buffers for kernel args (avoid GC pressure)
+    private final int[] argInt = new int[1];
+    private final float[] argFloat = new float[1];
+
+    private void setArgInt(cl_kernel kernel, int idx, int value) {
+        argInt[0] = value;
+        clSetKernelArg(kernel, idx, Sizeof.cl_int, Pointer.to(argInt));
+    }
+    private void setArgFloat(cl_kernel kernel, int idx, float value) {
+        argFloat[0] = value;
+        clSetKernelArg(kernel, idx, Sizeof.cl_float, Pointer.to(argFloat));
+    }
+
     public GpuInferenceEngine(Config config) {
         this.hiddenSize = config.embeddingLength;
         this.intermediateSize = config.hiddenLength;
@@ -340,13 +353,9 @@ public class GpuInferenceEngine {
             launchMatvecQ4(vProjData[layer], vProjScales[layer], bufNormOut, bufV,
                 vProjRows, hiddenSize, hiddenSize);
 
-            // 2c. RoPE on Q and K (per-head)
-            for (int h = 0; h < numHeads; h++) {
-                launchRope(bufQ, h * headDim, headDim, position);
-            }
-            for (int h = 0; h < numKVHeads; h++) {
-                launchRope(bufK, h * headDim, headDim, position);
-            }
+            // 2c. RoPE on Q and K (batched — one launch per buffer)
+            launchRopeBatched(bufQ, numHeads, headDim, position);
+            launchRopeBatched(bufK, numKVHeads, headDim, position);
 
             // 2d. Store K,V in cache at current position
             long kvOffset = (long) position * numKVHeads * headDim * Sizeof.cl_float;
@@ -391,14 +400,27 @@ public class GpuInferenceEngine {
         // 4. LM Head projection (tied weights = embedding transposed)
         launchLmHead(bufNormOut);
 
-        // 5. Sample from logits (temperature + top-k on CPU)
+        // 5. Sample from logits (top-k with temperature)
         float[] logits = new float[vocabSize];
         clEnqueueReadBuffer(queue, bufLogits, CL_TRUE, 0,
             (long) vocabSize * Sizeof.cl_float, Pointer.to(logits), 0, null, null);
 
-        int result = sampleTopK(logits, 0.7f, 40);
+        int result = sampleTopK(logits, 0.6f, 40);
         currentSeqLen = position + 1;
         return result;
+    }
+
+    /** Greedy argmax (for deterministic mode) */
+    private int argmax(float[] logits) {
+        int maxIdx = 0;
+        float maxVal = logits[0];
+        for (int i = 1; i < logits.length; i++) {
+            if (logits[i] > maxVal) {
+                maxVal = logits[i];
+                maxIdx = i;
+            }
+        }
+        return maxIdx;
     }
 
     /** Top-k sampling with temperature */
@@ -493,23 +515,25 @@ public class GpuInferenceEngine {
         clSetKernelArg(kMatvecQ4, 1, Sizeof.cl_mem, Pointer.to(scales));
         clSetKernelArg(kMatvecQ4, 2, Sizeof.cl_mem, Pointer.to(input));
         clSetKernelArg(kMatvecQ4, 3, Sizeof.cl_mem, Pointer.to(output));
-        clSetKernelArg(kMatvecQ4, 4, Sizeof.cl_int, Pointer.to(new int[]{M}));
-        clSetKernelArg(kMatvecQ4, 5, Sizeof.cl_int, Pointer.to(new int[]{K}));
-        clSetKernelArg(kMatvecQ4, 6, Sizeof.cl_int, Pointer.to(new int[]{0})); // rowOffset
-        clSetKernelArg(kMatvecQ4, 7, Sizeof.cl_int, Pointer.to(new int[]{0})); // colOffset
-        clSetKernelArg(kMatvecQ4, 8, Sizeof.cl_int, Pointer.to(new int[]{stride}));
+        setArgInt(kMatvecQ4, 4, M);
+        setArgInt(kMatvecQ4, 5, K);
+        setArgInt(kMatvecQ4, 6, 0);
+        setArgInt(kMatvecQ4, 7, 0);
+        setArgInt(kMatvecQ4, 8, stride);
         clEnqueueNDRangeKernel(queue, kMatvecQ4, 1, null,
             new long[]{roundUp(M, 256)}, new long[]{Math.min(256, M)}, 0, null, null);
     }
 
-    private void launchRope(cl_mem vec, int offset, int dim, int position) {
+    private void launchRopeBatched(cl_mem vec, int numH, int dim, int position) {
+        // Process all heads in one launch: globalSize = numHeads * (headDim/2)
+        int totalPairs = numH * (dim / 2);
         clSetKernelArg(kRope, 0, Sizeof.cl_mem, Pointer.to(vec));
-        clSetKernelArg(kRope, 1, Sizeof.cl_int, Pointer.to(new int[]{offset}));
+        clSetKernelArg(kRope, 1, Sizeof.cl_int, Pointer.to(new int[]{0}));
         clSetKernelArg(kRope, 2, Sizeof.cl_int, Pointer.to(new int[]{dim}));
         clSetKernelArg(kRope, 3, Sizeof.cl_int, Pointer.to(new int[]{position}));
         clSetKernelArg(kRope, 4, Sizeof.cl_float, Pointer.to(new float[]{ropeTheta}));
         clEnqueueNDRangeKernel(queue, kRope, 1, null,
-            new long[]{dim / 2}, null, 0, null, null);
+            new long[]{roundUp(totalPairs, 64)}, new long[]{64}, 0, null, null);
     }
 
     private void launchSiluMul(cl_mem gate, cl_mem up, cl_mem output, int dim) {
@@ -534,23 +558,22 @@ public class GpuInferenceEngine {
         int headsPerKV = numHeads / numKVHeads;
         float scale = (float) (1.0 / Math.sqrt(headDim));
 
-        // Launch one kernel per query head — each does scores + softmax + weighted sum on GPU
+        // Set args that don't change per head
+        clSetKernelArg(kAttentionHead, 0, Sizeof.cl_mem, Pointer.to(bufQ));
+        clSetKernelArg(kAttentionHead, 1, Sizeof.cl_mem, Pointer.to(kvCacheK[layer]));
+        clSetKernelArg(kAttentionHead, 2, Sizeof.cl_mem, Pointer.to(kvCacheV[layer]));
+        clSetKernelArg(kAttentionHead, 3, Sizeof.cl_mem, Pointer.to(bufAttnOut));
+        setArgInt(kAttentionHead, 4, headDim);
+        setArgInt(kAttentionHead, 5, seqLen);
+        setArgInt(kAttentionHead, 6, numKVHeads);
+        setArgFloat(kAttentionHead, 10, scale);
+
         for (int h = 0; h < numHeads; h++) {
             int kvHead = h / headsPerKV;
+            setArgInt(kAttentionHead, 7, kvHead);
+            setArgInt(kAttentionHead, 8, h * headDim);
+            setArgInt(kAttentionHead, 9, h * headDim);
 
-            clSetKernelArg(kAttentionHead, 0, Sizeof.cl_mem, Pointer.to(bufQ));
-            clSetKernelArg(kAttentionHead, 1, Sizeof.cl_mem, Pointer.to(kvCacheK[layer]));
-            clSetKernelArg(kAttentionHead, 2, Sizeof.cl_mem, Pointer.to(kvCacheV[layer]));
-            clSetKernelArg(kAttentionHead, 3, Sizeof.cl_mem, Pointer.to(bufAttnOut));
-            clSetKernelArg(kAttentionHead, 4, Sizeof.cl_int, Pointer.to(new int[]{headDim}));
-            clSetKernelArg(kAttentionHead, 5, Sizeof.cl_int, Pointer.to(new int[]{seqLen}));
-            clSetKernelArg(kAttentionHead, 6, Sizeof.cl_int, Pointer.to(new int[]{numKVHeads}));
-            clSetKernelArg(kAttentionHead, 7, Sizeof.cl_int, Pointer.to(new int[]{kvHead}));
-            clSetKernelArg(kAttentionHead, 8, Sizeof.cl_int, Pointer.to(new int[]{h * headDim}));
-            clSetKernelArg(kAttentionHead, 9, Sizeof.cl_int, Pointer.to(new int[]{h * headDim}));
-            clSetKernelArg(kAttentionHead, 10, Sizeof.cl_float, Pointer.to(new float[]{scale}));
-
-            // Single work-group with 128 threads (reduction kernel)
             clEnqueueNDRangeKernel(queue, kAttentionHead, 1, null,
                 new long[]{128}, new long[]{128}, 0, null, null);
         }

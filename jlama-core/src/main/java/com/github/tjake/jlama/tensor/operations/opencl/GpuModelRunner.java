@@ -71,10 +71,17 @@ public class GpuModelRunner {
         // Generate new tokens
         int generated = 0;
         int nextToken = lastToken;
+        List<Long> allTokens = new ArrayList<>();
+        String prevText = "";
+
         for (int i = 0; i < maxTokens; i++) {
-            String text = tokenizer.decode(new long[]{nextToken});
-            System.out.print(text);
+            allTokens.add((long) nextToken);
+            // Decode full sequence and print only the new part
+            String fullText = tokenizer.decode(allTokens.stream().mapToLong(Long::longValue).toArray());
+            String newText = fullText.substring(prevText.length());
+            System.out.print(newText);
             System.out.flush();
+            prevText = fullText;
             generated++;
 
             if (nextToken == 128001 || nextToken == 128008 || nextToken == 128009) break;

@@ -49,25 +49,29 @@ __kernel void rmsnorm(
 // ============================================================
 // Rotary Position Embedding (RoPE) - HuggingFace/Llama format
 // Pairs element [i] with element [i + dim/2] (halved, not interleaved)
+// BATCHED version: processes all heads in one kernel launch
 // ============================================================
 __kernel void rope(
-    __global float* vec,       // full Q or K buffer
-    const int vec_offset,      // float offset into vec for this head
+    __global float* vec,       // full Q or K buffer [numHeads * headDim]
+    const int vec_offset,      // UNUSED (kept for compat) - always 0 for batched
     const int dim,             // head_dim (e.g., 64)
     const int position,        // token position in sequence
     const float theta_base     // 500000.0 for Llama 3.x
 ) {
-    const int i = get_global_id(0); // pair index within this head
+    // global_id covers all pairs across all heads
+    const int gid = get_global_id(0);
     const int half_dim = dim / 2;
-    if (i >= half_dim) return;
+    const int head = gid / half_dim;      // which head
+    const int i = gid % half_dim;         // pair index within head
+
+    int headOffset = head * dim;
+    int idx0 = headOffset + i;            // first half
+    int idx1 = headOffset + i + half_dim;  // second half
 
     float freq = 1.0f / pow(theta_base, (float)(2 * i) / (float)dim);
     float angle = position * freq;
     float cos_val = cos(angle);
     float sin_val = sin(angle);
-
-    int idx0 = vec_offset + i;            // first half
-    int idx1 = vec_offset + i + half_dim;  // second half
 
     float x0 = vec[idx0];
     float x1 = vec[idx1];
