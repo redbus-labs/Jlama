@@ -114,23 +114,27 @@ __kernel void dot_product_batch(
     scores[head * seqLen + pos] = sum;
 }
 
-// Matrix-vector multiply: y = A[rowOffset:rowOffset+M] * x
+// Matrix-vector multiply: y = A[rowOffset:rowOffset+M, colOffset:colOffset+K] * x
 // Used for single-token inference (batch_size=1)
 // rowOffset allows computing a slice of the full weight matrix
+// colOffset allows starting from a column offset
+// stride is the full row width of A in memory
 __kernel void matvec_f32(
-    __global const float* A,    // [totalRows x K] weight matrix (full)
+    __global const float* A,    // [totalRows x stride] weight matrix (full)
     __global const float* x,    // [K] input vector
     __global float* y,          // [M] output vector
     const int M,                // number of rows to compute
-    const int K,                // input dimension
-    const int rowOffset         // start row in A
+    const int K,                // input dimension (columns to process)
+    const int rowOffset,        // start row in A
+    const int colOffset,        // start column in A
+    const int stride            // full row width in A
 ) {
     const int row = get_global_id(0);
     if (row >= M) return;
 
     float sum = 0.0f;
     int actualRow = row + rowOffset;
-    int offset = actualRow * K;
+    int offset = actualRow * stride + colOffset;
 
     // Vectorized accumulation (process 4 elements at a time)
     int k = 0;

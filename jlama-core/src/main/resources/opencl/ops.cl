@@ -1,255 +1,359 @@
 /**
- * ops.cl - Element-wise operations for LLM inference
+ * ops.cl - GPU inference kernels for LLM transformer forward pass
  *
- * Contains: RMSNorm, Softmax, RoPE, SwiGLU, Scale, Accumulate
+ * All activations are F32. Weights are Q4 (packed nibbles + float scales).
+ * These kernels keep everything on GPU — no CPU round-trips between layers.
  */
 
 // ============================================================
-// RMS Normalization
+// RMS Norm: output[i] = (input[i] / rms) * weight[i]
+// where rms = sqrt(mean(input^2) + eps)
 // ============================================================
-
-// Step 1: Compute sum of squares (reduction)
-__kernel void rms_norm_ss(
-    __global const float* input,   // [N]
-    __global float* sum_sq,        // [1] output: sum of squares
-    const int N
+__kernel void rmsnorm(
+    __global const float* input,    // [dim]
+    __global const float* weight,   // [dim] - learnable scale
+    __global float* output,         // [dim]
+    const int dim,
+    const float eps
 ) {
-    __local float localSums[256];
-    int lid = get_local_id(0);
-    int gid = get_global_id(0);
+    // First pass: compute sum of squares (single work-group reduction)
+    __local float partial_sums[256];
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
 
-    float sum = 0.0f;
-    for (int i = gid; i < N; i += get_global_size(0)) {
-        float v = input[i];
-        sum += v * v;
+    float local_sum = 0.0f;
+    for (int i = lid; i < dim; i += lsize) {
+        float val = input[i];
+        local_sum += val * val;
     }
-
-    localSums[lid] = sum;
+    partial_sums[lid] = local_sum;
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Parallel reduction within work-group
-    for (int stride = get_local_size(0) / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            localSums[lid] += localSums[lid + stride];
+    // Tree reduction
+    for (int s = lsize / 2; s > 0; s >>= 1) {
+        if (lid < s) {
+            partial_sums[lid] += partial_sums[lid + s];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    if (lid == 0) {
-        atomic_add_float(sum_sq, localSums[0]);
-    }
-}
+    float rms = sqrt(partial_sums[0] / dim + eps);
 
-// Step 2: Apply normalization with weight
-__kernel void rms_norm_apply(
-    __global const float* input,   // [N]
-    __global const float* weight,  // [N] learned scale
-    __global float* output,        // [N]
-    const float rms_inv,           // 1 / sqrt(mean_sq + eps)
-    const int N
-) {
-    int i = get_global_id(0);
-    if (i >= N) return;
-    output[i] = input[i] * rms_inv * weight[i];
-}
-
-// Combined RMSNorm (single kernel, less efficient but simpler)
-__kernel void rms_norm(
-    __global const float* input,
-    __global const float* weight,
-    __global float* output,
-    const int N,
-    const float eps
-) {
-    // Compute sum of squares
-    float ss = 0.0f;
-    for (int i = 0; i < N; i++) {
-        ss += input[i] * input[i];
-    }
-    float rms_inv = rsqrt(ss / (float)N + eps);
-
-    // Apply normalization
-    int i = get_global_id(0);
-    if (i >= N) return;
-    output[i] = input[i] * rms_inv * weight[i];
-}
-
-// ============================================================
-// Softmax
-// ============================================================
-
-// Softmax over a vector (for attention scores)
-// Note: For production, split into max-reduction, exp, sum-reduction, divide
-__kernel void softmax(
-    __global float* data,    // [N] in-place
-    const int N
-) {
-    // Find max for numerical stability
-    float maxVal = -INFINITY;
-    for (int i = 0; i < N; i++) {
-        maxVal = fmax(maxVal, data[i]);
-    }
-
-    // Compute exp and sum
-    float sumExp = 0.0f;
-    for (int i = 0; i < N; i++) {
-        data[i] = exp(data[i] - maxVal);
-        sumExp += data[i];
-    }
-
-    // Normalize
-    float invSum = 1.0f / sumExp;
-    for (int i = 0; i < N; i++) {
-        data[i] *= invSum;
-    }
-}
-
-// Parallel softmax: each work-item handles one row
-__kernel void softmax_rows(
-    __global float* data,    // [rows x cols]
-    const int cols
-) {
-    int row = get_global_id(0);
-    int offset = row * cols;
-
-    float maxVal = -INFINITY;
-    for (int i = 0; i < cols; i++) {
-        maxVal = fmax(maxVal, data[offset + i]);
-    }
-
-    float sumExp = 0.0f;
-    for (int i = 0; i < cols; i++) {
-        data[offset + i] = exp(data[offset + i] - maxVal);
-        sumExp += data[offset + i];
-    }
-
-    float invSum = 1.0f / sumExp;
-    for (int i = 0; i < cols; i++) {
-        data[offset + i] *= invSum;
+    // Second pass: normalize and scale
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int i = lid; i < dim; i += lsize) {
+        output[i] = (input[i] / rms) * weight[i];
     }
 }
 
 // ============================================================
-// Rotary Position Embedding (RoPE)
+// Rotary Position Embedding (RoPE) - HuggingFace/Llama format
+// Pairs element [i] with element [i + dim/2] (halved, not interleaved)
 // ============================================================
-
-// Apply RoPE rotation to query/key vectors
-__kernel void rope_apply(
-    __global float* vec,         // [headSize] query or key vector
-    __global const float* freqs_cos,  // [headSize/2] precomputed cos
-    __global const float* freqs_sin,  // [headSize/2] precomputed sin
-    const int headSize,
-    const int offset              // head offset into vec
+__kernel void rope(
+    __global float* vec,       // full Q or K buffer
+    const int vec_offset,      // float offset into vec for this head
+    const int dim,             // head_dim (e.g., 64)
+    const int position,        // token position in sequence
+    const float theta_base     // 500000.0 for Llama 3.x
 ) {
-    int i = get_global_id(0);
-    int halfHead = headSize / 2;
-    if (i >= halfHead) return;
+    const int i = get_global_id(0); // pair index within this head
+    const int half_dim = dim / 2;
+    if (i >= half_dim) return;
 
-    int idx0 = offset + i;
-    int idx1 = offset + i + halfHead;
+    float freq = 1.0f / pow(theta_base, (float)(2 * i) / (float)dim);
+    float angle = position * freq;
+    float cos_val = cos(angle);
+    float sin_val = sin(angle);
 
-    float v0 = vec[idx0];
-    float v1 = vec[idx1];
-    float fc = freqs_cos[i];
-    float fs = freqs_sin[i];
+    int idx0 = vec_offset + i;            // first half
+    int idx1 = vec_offset + i + half_dim;  // second half
 
-    // Complex rotation: (v0 + i*v1) * (cos + i*sin)
-    vec[idx0] = v0 * fc - v1 * fs;
-    vec[idx1] = v0 * fs + v1 * fc;
+    float x0 = vec[idx0];
+    float x1 = vec[idx1];
+
+    vec[idx0] = x0 * cos_val - x1 * sin_val;
+    vec[idx1] = x0 * sin_val + x1 * cos_val;
 }
 
 // ============================================================
-// SwiGLU Activation (used in FFN/MLP)
+// SiLU (Swish) activation * gate: output = silu(gate) * up
+// silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
 // ============================================================
-
-// SwiGLU: output = silu(gate) * up
-// where silu(x) = x * sigmoid(x)
-__kernel void swiglu(
-    __global const float* gate,   // [N] from gate_proj
-    __global const float* up,     // [N] from up_proj
-    __global float* output,       // [N]
-    const int N
+__kernel void silu_mul(
+    __global const float* gate,    // [dim] - gate projection output
+    __global const float* up,      // [dim] - up projection output
+    __global float* output,        // [dim]
+    const int dim
 ) {
-    int i = get_global_id(0);
-    if (i >= N) return;
+    const int i = get_global_id(0);
+    if (i >= dim) return;
 
     float g = gate[i];
-    float silu = g / (1.0f + exp(-g)); // silu = x * sigmoid(x)
-    output[i] = silu * up[i];
-}
-
-// GELU activation (used in Gemma 4)
-// gelu_pytorch_tanh approximation
-__kernel void gelu_tanh(
-    __global float* data,    // [N] in-place
-    const int N
-) {
-    int i = get_global_id(0);
-    if (i >= N) return;
-
-    float x = data[i];
-    // Approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    float x3 = x * x * x;
-    float inner = 0.7978845608f * (x + 0.044715f * x3); // sqrt(2/pi) ≈ 0.7978845608
-    data[i] = 0.5f * x * (1.0f + tanh(inner));
+    float silu_g = g / (1.0f + exp(-g));
+    output[i] = silu_g * up[i];
 }
 
 // ============================================================
-// Utility Kernels
+// Softmax: output[i] = exp(input[i] - max) / sum(exp(input - max))
+// Single work-group for the attention score vector
 // ============================================================
-
-// Scale a vector: x *= scale
-__kernel void scale(
-    __global float* data,
-    const float scale_factor,
-    const int N
+__kernel void softmax(
+    __global float* data,      // [len] - in-place softmax
+    const int len
 ) {
-    int i = get_global_id(0);
-    if (i >= N) return;
-    data[i] *= scale_factor;
+    __local float shared[256];
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+
+    // Find max
+    float local_max = -INFINITY;
+    for (int i = lid; i < len; i += lsize) {
+        local_max = fmax(local_max, data[i]);
+    }
+    shared[lid] = local_max;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int s = lsize / 2; s > 0; s >>= 1) {
+        if (lid < s) shared[lid] = fmax(shared[lid], shared[lid + s]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float max_val = shared[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Compute exp and sum
+    float local_sum = 0.0f;
+    for (int i = lid; i < len; i += lsize) {
+        float e = exp(data[i] - max_val);
+        data[i] = e;
+        local_sum += e;
+    }
+    shared[lid] = local_sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int s = lsize / 2; s > 0; s >>= 1) {
+        if (lid < s) shared[lid] += shared[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float total_sum = shared[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Normalize
+    for (int i = lid; i < len; i += lsize) {
+        data[i] /= total_sum;
+    }
 }
 
-// Accumulate: a += b
-__kernel void accumulate(
-    __global float* a,
-    __global const float* b,
-    const int N
+// ============================================================
+// Attention: compute scores, softmax, weighted sum for ONE head
+// All on GPU — no CPU round-trips for KV cache reads
+// ============================================================
+__kernel void attention_head(
+    __global const float* Q,        // [headDim] query for this head
+    __global const float* K_cache,  // [maxSeqLen x numKVHeads x headDim] full KV cache
+    __global const float* V_cache,  // same layout as K
+    __global float* output,         // [headDim] attention output for this head
+    const int headDim,
+    const int seqLen,               // number of positions to attend to
+    const int numKVHeads,
+    const int kvHead,               // which KV head to use
+    const int qHeadOffset,          // offset into Q buffer for this head
+    const int outHeadOffset,        // offset into output buffer for this head
+    const float scale               // 1/sqrt(headDim)
 ) {
-    int i = get_global_id(0);
-    if (i >= N) return;
+    // Single work-group computes full attention for one head
+    __local float scores[2048];     // max seq len supported
+    __local float shared[256];
+
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+
+    // Step 1: Compute attention scores (Q dot K for each position)
+    for (int pos = lid; pos < seqLen; pos += lsize) {
+        float dot = 0.0f;
+        int kOffset = pos * numKVHeads * headDim + kvHead * headDim;
+        for (int d = 0; d < headDim; d++) {
+            dot += Q[qHeadOffset + d] * K_cache[kOffset + d];
+        }
+        scores[pos] = dot * scale;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Step 2: Softmax - find max
+    float local_max = -INFINITY;
+    for (int i = lid; i < seqLen; i += lsize) {
+        local_max = fmax(local_max, scores[i]);
+    }
+    shared[lid] = local_max;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = lsize / 2; s > 0; s >>= 1) {
+        if (lid < s) shared[lid] = fmax(shared[lid], shared[lid + s]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float max_val = shared[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Softmax - exp and sum
+    float local_sum = 0.0f;
+    for (int i = lid; i < seqLen; i += lsize) {
+        float e = exp(scores[i] - max_val);
+        scores[i] = e;
+        local_sum += e;
+    }
+    shared[lid] = local_sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = lsize / 2; s > 0; s >>= 1) {
+        if (lid < s) shared[lid] += shared[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float total_sum = shared[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Normalize
+    for (int i = lid; i < seqLen; i += lsize) {
+        scores[i] /= total_sum;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Step 3: Weighted sum of V
+    for (int d = lid; d < headDim; d += lsize) {
+        float sum = 0.0f;
+        for (int pos = 0; pos < seqLen; pos++) {
+            int vOffset = pos * numKVHeads * headDim + kvHead * headDim;
+            sum += scores[pos] * V_cache[vOffset + d];
+        }
+        output[outHeadOffset + d] = sum;
+    }
+}
+
+// ============================================================
+// Residual Add: output[i] = a[i] + b[i]
+// ============================================================
+__kernel void residual_add(
+    __global float* a,         // [dim] - accumulates in place
+    __global const float* b,   // [dim]
+    const int dim
+) {
+    const int i = get_global_id(0);
+    if (i >= dim) return;
     a[i] += b[i];
 }
 
-// Clamp (for ClippableLinear)
-__kernel void clamp_tensor(
-    __global float* data,
-    const float min_val,
-    const float max_val,
-    const int N
+// ============================================================
+// Embedding Lookup: copy one row from embedding table
+// Embedding stored as F32 (dequantized at upload) since it's small
+// ============================================================
+__kernel void embedding_lookup(
+    __global const float* embed_table,  // [vocab_size x dim]
+    __global float* output,             // [dim]
+    const int token_id,
+    const int dim
 ) {
-    int i = get_global_id(0);
-    if (i >= N) return;
-    data[i] = fmax(min_val, fmin(max_val, data[i]));
+    const int i = get_global_id(0);
+    if (i >= dim) return;
+    output[i] = embed_table[token_id * dim + i];
 }
 
-// Copy with type conversion (BF16 -> F32)
-__kernel void bf16_to_f32(
-    __global const ushort* input,   // BF16 stored as ushort
-    __global float* output,
-    const int N
+// ============================================================
+// Argmax: find index of maximum value
+// Returns result in output[0]
+// ============================================================
+__kernel void argmax(
+    __global const float* data,    // [len]
+    __global int* result,          // [1] - output token id
+    const int len
 ) {
-    int i = get_global_id(0);
-    if (i >= N) return;
-    // BF16 to F32: shift left by 16 bits
-    uint bits = (uint)input[i] << 16;
-    output[i] = as_float(bits);
+    // Single work-item version (simple, len = vocab_size ~32K-128K)
+    // For production, use parallel reduction
+    float max_val = -INFINITY;
+    int max_idx = 0;
+    for (int i = 0; i < len; i++) {
+        if (data[i] > max_val) {
+            max_val = data[i];
+            max_idx = i;
+        }
+    }
+    result[0] = max_idx;
 }
 
-// Atomic float add helper (for reductions)
-inline void atomic_add_float(__global float* addr, float val) {
-    union { unsigned int u; float f; } old_val, new_val;
-    do {
-        old_val.f = *addr;
-        new_val.f = old_val.f + val;
-    } while (atomic_cmpxchg((__global unsigned int*)addr, old_val.u, new_val.u) != old_val.u);
+// ============================================================
+// Q4 Matrix-vector multiply (from gemm_q4.cl, included here for
+// self-contained full-graph execution)
+// ============================================================
+#define Q4_BLOCK_SIZE 32
+#define Q4_HALF_BLOCK 16
+
+__kernel void matvec_q4(
+    __global const uchar* A_q4,
+    __global const float* A_scales,
+    __global const float* x,
+    __global float* y,
+    const int M,
+    const int K,
+    const int rowOffset,
+    const int colOffset,
+    const int stride
+) {
+    const int row = get_global_id(0);
+    if (row >= M) return;
+
+    const int actualRow = row + rowOffset;
+    const int bytesPerRow = stride / 2;
+    const int blocksPerRow = stride / Q4_BLOCK_SIZE;
+    const int startBlock = colOffset / Q4_BLOCK_SIZE;
+    const int rowDataOffset = actualRow * bytesPerRow;
+    const int rowScaleOffset = actualRow * blocksPerRow;
+    const int numBlocks = K / Q4_BLOCK_SIZE;
+
+    float sum = 0.0f;
+
+    for (int b = 0; b < numBlocks; b++) {
+        int block = startBlock + b;
+        float scale = A_scales[rowScaleOffset + block];
+        int blockByteOffset = rowDataOffset + block * Q4_HALF_BLOCK;
+        int inputStart = b * Q4_BLOCK_SIZE;
+
+        for (int j = 0; j < Q4_HALF_BLOCK; j++) {
+            uchar packed = A_q4[blockByteOffset + j];
+
+            int x0 = (packed & 0x0F) - 8;
+            sum += (x0 * scale) * x[inputStart + j];
+
+            int x1 = ((packed >> 4) & 0x0F) - 8;
+            sum += (x1 * scale) * x[inputStart + j + Q4_HALF_BLOCK];
+        }
+    }
+
+    y[row] = sum;
+}
+
+// ============================================================
+// F32 Matrix-vector multiply (for embedding/lm_head which may be F32)
+// ============================================================
+__kernel void matvec_f32(
+    __global const float* A,
+    __global const float* x,
+    __global float* y,
+    const int M,
+    const int K,
+    const int rowOffset
+) {
+    const int row = get_global_id(0);
+    if (row >= M) return;
+
+    const int actualRow = row + rowOffset;
+    const int offset = actualRow * K;
+
+    float sum = 0.0f;
+    int k = 0;
+    for (; k + 3 < K; k += 4) {
+        float4 a = vload4(0, A + offset + k);
+        float4 b = vload4(0, x + k);
+        sum += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+    for (; k < K; k++) {
+        sum += A[offset + k] * x[k];
+    }
+
+    y[row] = sum;
 }
